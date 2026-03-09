@@ -38,7 +38,7 @@ except ImportError:
     sys.exit(1)
 
 # Import our ML modules
-sys.path.insert(0, 'd:/EDI_Project/src')
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 try:
     from fatigue_model import FatiguePredictionModel
     from anomaly_detection import BehavioralDriftDetector
