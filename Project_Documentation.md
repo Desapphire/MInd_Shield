@@ -15,9 +15,13 @@
 7. [Real-time Monitoring System](#real-time-monitoring-system)
 8. [Focus AI Mode](#focus-ai-mode)
 9. [Posture Detection System](#posture-detection-system)
-10. [Technology Stack](#technology-stack)
-11. [Future Enhancements](#future-enhancements)
-12. [Patent Potential](#patent-potential)
+10. [Local Face Authentication](#local-face-authentication)
+11. [Complete Model Catalog](#complete-model-catalog)
+12. [Data Storage and Privacy](#data-storage-and-privacy)
+13. [Math Formula Reference](#math-formula-reference)
+14. [Technology Stack](#technology-stack)
+15. [Future Enhancements](#future-enhancements)
+16. [Patent Potential](#patent-potential)
 
 ---
 
@@ -460,13 +464,7 @@ DISTRACTING_APPS = [
 # If distraction detected → Increment counter + Warning
 ```
 
-### 3. Focus Score Calculation
 
-```python
-focus_score = 100 - (distraction_count * penalty_per_distraction)
-# Score decreases with each distraction
-# Provides feedback on focus quality
-```
 
 ### 4. Session Statistics
 
@@ -531,6 +529,78 @@ focus_score = 100 - (distraction_count * penalty_per_distraction)
 
 ---
 
+# 🔐 LOCAL FACE AUTHENTICATION
+
+## Purpose
+
+Local Face Auth ensures the **enrolled user remains present** and prevents unauthorized users from taking over the session during live monitoring or presentations.
+
+## Core Logic
+
+1. Webcam frames are captured by the posture pipeline.
+2. A single face is detected and embedded locally.
+3. The embedding is compared to the enrolled profile.
+4. A grace window prevents false lockouts.
+5. The UI locks only after sustained absence or unknown detection.
+
+## Stability Features
+
+- Grace period after the last successful authorization.
+- Absent/unknown lockout only after sustained duration.
+- Uses raw webcam frames (no skeleton overlay interference).
+
+## Code Paths
+
+- Face engine: [src/presence_auth.py](src/presence_auth.py)
+- GUI policy and lock overlay: [mindshield.py](mindshield.py)
+
+---
+
+# 🧩 COMPLETE MODEL CATALOG
+
+This list summarizes every model and scoring engine used in Mind-Shield+.
+
+| Module | Model / Method | Purpose | Output |
+|--------|----------------|---------|--------|
+| fatigue_model | Random Forest / Gradient Boosting / Logistic | Fatigue probability | $P(\text{fatigue})$ |
+| anomaly_detection | Isolation Forest | Behavioral drift score | Drift magnitude + anomaly flag |
+| cognitive_load | Weighted heuristic | Mental effort estimate | Load score (0-100) |
+| risk_evaluation | Weighted fusion + rules | Unified risk state | Risk score + level |
+| posture_detection | MediaPipe PoseLandmarker | Posture quality | Posture score + issues |
+| presence_auth | Local embedding + cosine | Face auth + presence | Authorized / Unknown / Absent |
+| burnout_engine | Trend + thresholds | Burnout risk trend | Burnout level |
+| emotion_engine | Heuristic mapping | Stress + energy | Emotion state |
+| decision_engine | Rule-based | Recommendations | Action list |
+| prediction | Simple forecast | Short-term trend | Predicted metrics |
+| adaptive_learning | Online updates | Personalization | Adapted baselines |
+| pro_features | Session history | Insights + streaks | Summary stats |
+
+# DATA STORAGE AND PRIVACY
+
+## Temporary vs Persistent Data
+
+- Live monitoring data is processed in memory and reset when the session ends.
+- Focus session exports are optional and saved only when the user chooses to export.
+- Face authentication profiles are stored locally and encrypted at rest.
+- No cloud uploads and no telemetry.
+
+## Study Files
+
+- Full flow: [docs/Project_Flow.md](docs/Project_Flow.md)
+- Formula reference: [docs/Model_Formulas.md](docs/Model_Formulas.md)
+
+# MATH FORMULA REFERENCE
+
+Key formulas are provided below and a full set is in [docs/Model_Formulas.md](docs/Model_Formulas.md).
+
+$$
+	ext{Risk} = 0.30 \cdot \text{Load} + 0.40 \cdot (100 \cdot P_{fatigue}) + 0.30 \cdot (100 \cdot D_{drift})
+$$
+
+$$
+	ext{sim}(a,b) = \frac{a \cdot b}{\|a\|\,\|b\|}
+$$
+
 # 💻 TECHNOLOGY STACK
 
 ## Languages & Frameworks
@@ -560,7 +630,7 @@ focus_score = 100 - (distraction_count * penalty_per_distraction)
 ## File Structure
 
 ```
-d:\EDI_Project\
+EDI_Project/
 ├── mindshield.py              # Main application (GUI + Logic)
 ├── requirements.txt           # Dependencies
 ├── README.md                  # Basic documentation
@@ -575,6 +645,8 @@ d:\EDI_Project\
     ├── visualization.py       # Chart generation
     └── pose_landmarker_lite.task  # MediaPipe model
 ```
+
+Note: All file locations are resolved dynamically relative to the project root. You can override the pose model path with `MINDSHIELD_POSE_MODEL`.
 
 ---
 
@@ -769,6 +841,6 @@ A: The multi-modal behavioral fusion approach - combining typing biometrics, mou
 
 ---
 
-_Document Version: 1.0_
-_Last Updated: March 8, 2026_
+_Document Version: 1.1_
+_Last Updated: May 21, 2026_
 _Project: Mind-Shield+ Cognitive Fatigue Detection System_

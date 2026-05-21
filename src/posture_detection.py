@@ -362,7 +362,7 @@ class PostureDetector:
                     # Send callback
                     if self.callback:
                         try:
-                            self.callback(status, frame_with_skeleton)
+                            self.callback(status, frame_with_skeleton, frame)
                         except Exception as e:
                             print(f"Callback error: {e}")
                             

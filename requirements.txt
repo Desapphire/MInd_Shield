@@ -1,4 +1,4 @@
-# Mind-Shield+ Core Dependencies
+# Mind-Shield+ Desktop Application Dependencies
 # Python 3.10+ required
 
 # Numerical Computing
@@ -12,14 +12,24 @@ scikit-learn>=1.3.0
 
 # Visualization
 matplotlib>=3.7.0
-seaborn>=0.12.0
 
+<<<<<<< HEAD
 # Web Application
 flask>=2.3.0
 flask-cors>=4.0.0
 pynput
 psutil
 mediapipe
+=======
+# GUI & Desktop Monitoring
+pynput>=1.7.6
+psutil>=5.9.0
+pillow>=10.0.0
+>>>>>>> c1412b8 (updated)
 
-# Optional: Deep Learning (uncomment if needed)
-# torch>=2.0.0
+# Computer Vision & Posture Detection
+opencv-python>=4.8.0
+mediapipe>=0.10.9
+
+# Install all with:
+# pip install -r requirements.txt

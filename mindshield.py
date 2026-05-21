@@ -38,10 +38,21 @@ except ImportError:
     sys.exit(1)
 
 # Import our ML modules
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+sys.path.insert(0, 'd:/EDI_Project/src')
 try:
     from fatigue_model import FatiguePredictionModel
     from anomaly_detection import BehavioralDriftDetector
+    from pro_features import PersonalBaselineManager, InterventionEngine, SessionStore
+    from alert_explain import build_alert_explanations
+    from decision_engine import generate_recommendations
+    from prediction import forecast_metrics
+    from gamification import GamificationTracker
+    from adaptive_learning import AdaptiveLearningEngine
+    from emotion_engine import EmotionEngine
+    from burnout_engine import BurnoutEngine
+    from local_storage import LocalStorage
+    from privacy_controls import PrivacyController
+    from event_bus import EventBus
 except ImportError as e:
     print(f"Error importing ML modules: {e}")
     sys.exit(1)
@@ -52,12 +63,14 @@ try:
     import cv2
     from PIL import Image, ImageTk
     PIL_AVAILABLE = True
+    from presence_auth import LocalFaceAuthenticator
 except (ImportError, AttributeError, Exception) as e:
     print(f"Posture detection not available: {e}")
     MEDIAPIPE_AVAILABLE = False
     CV2_AVAILABLE = False
     PIL_AVAILABLE = False
     PostureDetector = None
+    LocalFaceAuthenticator = None
 
 
 # ============================================================================
@@ -318,6 +331,8 @@ class SystemBehaviorCapture:
         # Track error keys
         if key in [Key.backspace, Key.delete]:
             self.error_keys += 1
+            if self.char_since_space > 0:
+                self.char_since_space -= 1
         
         # Word counting
         try:
@@ -327,6 +342,14 @@ class SystemBehaviorCapture:
                     if self.char_since_space > 1:
                         self.word_count += 1
                     self.char_since_space = 0
+        except:
+            pass
+
+        try:
+            if key in [Key.space, Key.enter]:
+                if self.char_since_space > 1:
+                    self.word_count += 1
+                self.char_since_space = 0
         except:
             pass
         
@@ -430,14 +453,17 @@ class SystemBehaviorCapture:
             typing_speed_cpm = 0
             speed_variance = 0
         
-        typing_speed_wpm = max(typing_speed_cpm / 5, self.word_count / session_minutes)
-        
-        # Error rate
-        error_rate = self.error_keys / max(self.total_keys, 1)
-        
         # Activity in last minute
         recent_keys = len([k for k in self.keystrokes if now - k['time'] < 60])
         recent_clicks = len([c for c in self.mouse_clicks if now - c['time'] < 60])
+
+        wpm_from_intervals = typing_speed_cpm / 5 if typing_speed_cpm > 0 else 0
+        wpm_from_recent = recent_keys / 5 if recent_keys > 0 else 0
+        wpm_from_words = self.word_count / session_minutes
+        typing_speed_wpm = max(wpm_from_intervals, wpm_from_recent, wpm_from_words)
+        
+        # Error rate
+        error_rate = self.error_keys / max(self.total_keys, 1)
         
         # App switches per minute (last 5 min)
         recent_switches = [s for s in self.app_switches if now - s['time'] < 300]
@@ -795,31 +821,51 @@ class MindShieldGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Mind-Shield+ v2.2")
-        self.root.geometry("1100x850")
-        self.root.minsize(900, 700)
-        self.root.configure(bg='#0d1117')
+        self.root.geometry("1200x900")
+        self.root.minsize(1000, 760)
+        self.root.configure(bg='#0b0f1a')
         self.root.resizable(True, True)
         
         # Colors
         self.c = {
-            'bg': '#0d1117',
-            'card': '#161b22',
-            'border': '#30363d',
-            'green': '#3fb950',
-            'yellow': '#d29922',
-            'orange': '#db6d28',
-            'red': '#f85149',
-            'blue': '#58a6ff',
-            'purple': '#a371f7',
-            'text': '#e6edf3',
-            'dim': '#8b949e',
-            'focus_bg': '#1a1f2e',
+            'bg': '#0b0f1a',
+            'card': '#121826',
+            'border': '#2a3246',
+            'green': '#00f5a0',
+            'yellow': '#f5c542',
+            'orange': '#ff8a3d',
+            'red': '#ff4d6d',
+            'blue': '#4cc9f0',
+            'pink': '#ff6fb5',
+            'text': '#eaf2ff',
+            'dim': '#9aa4b2',
+            'focus_bg': '#1b2a3d',
         }
         
         # State
         self.monitoring = False
         self.capture = None
         self.engine = MindShieldEngine()
+        self.baseline_manager = PersonalBaselineManager(calibration_samples=120)
+        self.intervention_engine = InterventionEngine()
+        self.session_store = SessionStore()
+        self.gamification = GamificationTracker()
+        self.adaptive_learning = AdaptiveLearningEngine()
+        self.emotion_engine = EmotionEngine()
+        self.burnout_engine = BurnoutEngine()
+        self.local_storage = LocalStorage()
+        self.privacy = PrivacyController()
+        self.event_bus = EventBus()
+        self.last_persist_time = 0
+        self.last_summary_refresh = 0
+        self.latest_posture_score = None
+        self.study_mode_enabled = False
+        self._risk_pulse_active = False
+        self._risk_pulse_on = False
+        self._risk_pulse_job = None
+        self._streak_pulse_on = False
+        self.latest_emotion_state = None
+        self.latest_burnout_state = None
         
         # Focus Mode
         self.focus_session = FocusSession()
@@ -829,6 +875,26 @@ class MindShieldGUI:
         # Posture Detection
         self.posture_detector = None
         self.posture_enabled = False
+        self.last_posture_good = None
+        self.last_camera_frame = None
+        self.face_auth = None
+        self.face_auth_enabled = False
+        self.face_auth_locked = False
+        self.face_auth_state = None
+        self.face_auth_name_var = tk.StringVar(value="Primary User")
+        self.face_auth_last_auth_ts = 0.0
+        self.face_auth_last_seen_ts = 0.0
+        self.face_auth_grace_seconds = 2
+        self.face_auth_absent_seconds = 12
+        self.face_auth_unknown_since = 0.0
+        self.face_auth_unknown_seconds = 12
+        self.face_auth_enroll_in_progress = False
+        self.face_auth_last_auth_ts = 0.0
+        self.face_auth_last_seen_ts = 0.0
+        self.face_auth_grace_seconds = 10
+        self.face_auth_absent_seconds = 10
+        self.face_auth_unknown_since = 0.0
+        self.face_auth_unknown_seconds = 12
         if PostureDetector:
             try:
                 self.posture_detector = PostureDetector()
@@ -837,6 +903,15 @@ class MindShieldGUI:
             except Exception as e:
                 print(f"Posture detection not available: {e}")
                 self.posture_detector = None
+        if LocalFaceAuthenticator:
+            try:
+                self.face_auth = LocalFaceAuthenticator(
+                    profile_name=self.face_auth_name_var.get(),
+                    threshold=0.75,
+                )
+            except Exception as e:
+                print(f"Local face auth not available: {e}")
+                self.face_auth = None
         
         # Graph data (last 30 data points)
         self.graph_data = {
@@ -852,42 +927,62 @@ class MindShieldGUI:
     def _build_ui(self):
         """Build compact UI."""
         # Header
-        header = tk.Frame(self.root, bg=self.c['card'], height=45)
+        header = tk.Frame(self.root, bg=self.c['card'], height=60)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
         
-        tk.Label(header, text="🛡️ Mind-Shield+", font=('Segoe UI', 14, 'bold'),
-                bg=self.c['card'], fg=self.c['text']).pack(side=tk.LEFT, padx=15, pady=8)
+        title = tk.Frame(header, bg=self.c['card'])
+        title.pack(side=tk.LEFT, padx=15, pady=8)
+
+        tk.Label(title, text="🛡️ Mind-Shield+", font=('Bahnschrift', 16, 'bold'),
+            bg=self.c['card'], fg=self.c['text']).pack(anchor=tk.W)
+        tk.Label(title, text="Focus. Flow. Finish.", font=('Bahnschrift', 9),
+            bg=self.c['card'], fg=self.c['dim']).pack(anchor=tk.W)
         
-        self.status = tk.Label(header, text="● Stopped", font=('Segoe UI', 11),
-                              bg=self.c['card'], fg=self.c['red'])
-        self.status.pack(side=tk.RIGHT, padx=15)
+        self.status = tk.Label(header, text="● Stopped", font=('Bahnschrift', 10, 'bold'),
+                      bg=self.c['card'], fg=self.c['red'])
+        self.status.pack(side=tk.RIGHT, padx=12)
+
+        self.status_badge = tk.Label(header, text="OFFLINE", font=('Bahnschrift', 9, 'bold'),
+                         bg=self.c['border'], fg=self.c['dim'], padx=10, pady=4)
+        self.status_badge.pack(side=tk.RIGHT, padx=8)
+
+        self.privacy_badge = tk.Label(header, text="LOCAL ONLY", font=('Bahnschrift', 9, 'bold'),
+                 bg=self.c['focus_bg'], fg=self.c['blue'], padx=10, pady=4)
+        self.privacy_badge.pack(side=tk.RIGHT, padx=(0, 8))
         
         # Main area
         main = tk.Frame(self.root, bg=self.c['bg'])
         main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
         # Left panel (risk + metrics)
-        left = tk.Frame(main, bg=self.c['bg'], width=280)
+        left = tk.Frame(main, bg=self.c['bg'], width=300)
         left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
         left.pack_propagate(False)
         
         # Risk card
         risk_card = tk.Frame(left, bg=self.c['card'], highlightbackground=self.c['border'], highlightthickness=1)
         risk_card.pack(fill=tk.X, pady=(0, 8))
+        self.risk_card = risk_card
+        self._add_card_accent(risk_card, self.c['pink'], self.c['blue'])
         
-        tk.Label(risk_card, text="Risk Level", font=('Segoe UI', 11),
+        tk.Label(risk_card, text="Risk Level", font=('Bahnschrift', 11),
                 bg=self.c['card'], fg=self.c['dim']).pack(pady=(10, 0))
         
-        self.risk_val = tk.Label(risk_card, text="--", font=('Segoe UI', 42, 'bold'),
+        self.risk_val = tk.Label(risk_card, text="--", font=('Bahnschrift', 46, 'bold'),
                                  bg=self.c['card'], fg=self.c['green'])
         self.risk_val.pack()
         
-        self.risk_lvl = tk.Label(risk_card, text="READY", font=('Segoe UI', 12, 'bold'),
+        self.risk_lvl = tk.Label(risk_card, text="READY", font=('Bahnschrift', 12, 'bold'),
                                 bg=self.c['card'], fg=self.c['dim'])
         self.risk_lvl.pack()
+
+        # Risk progress bar
+        self.risk_bar = tk.Canvas(risk_card, height=8, bg=self.c['border'], highlightthickness=0)
+        self.risk_bar.pack(fill=tk.X, padx=12, pady=(6, 6))
+        self.risk_bar_fill = self.risk_bar.create_rectangle(0, 0, 0, 8, fill=self.c['green'], width=0)
         
-        self.trend_lbl = tk.Label(risk_card, text="", font=('Segoe UI', 10),
+        self.trend_lbl = tk.Label(risk_card, text="", font=('Bahnschrift', 10),
                                  bg=self.c['card'], fg=self.c['dim'])
         self.trend_lbl.pack(pady=(0, 10))
         
@@ -896,10 +991,12 @@ class MindShieldGUI:
         metrics_data = [
             ('cognitive', '🧠 Cognitive Load'),
             ('fatigue', '😴 Fatigue'),
+            ('state', '🧩 Unified State'),
             ('focus', '🎯 Focus'),
             ('productivity', '📈 Productivity'),
             ('drift', '📊 Drift'),
             ('eye_strain', '👁️ Eye Strain'),
+            ('confidence', '🔍 Model Confidence'),
             ('typing', '⌨️ Typing Speed'),
             ('errors', '❌ Errors'),
         ]
@@ -911,10 +1008,10 @@ class MindShieldGUI:
             inner = tk.Frame(card, bg=self.c['card'])
             inner.pack(fill=tk.X, padx=10, pady=6)
             
-            tk.Label(inner, text=label, font=('Segoe UI', 9),
+            tk.Label(inner, text=label, font=('Bahnschrift', 9),
                     bg=self.c['card'], fg=self.c['dim']).pack(side=tk.LEFT)
             
-            val = tk.Label(inner, text="--", font=('Segoe UI', 11, 'bold'),
+            val = tk.Label(inner, text="--", font=('Bahnschrift', 12, 'bold'),
                           bg=self.c['card'], fg=self.c['text'])
             val.pack(side=tk.RIGHT)
             self.metrics[key] = val
@@ -942,60 +1039,156 @@ class MindShieldGUI:
         
         # Enable mousewheel scrolling for right panel
         def _on_mousewheel(event):
-            right_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        right_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            delta = event.delta
+            if delta == 0 and hasattr(event, "num"):
+                delta = 120 if event.num == 4 else -120
+            right_canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+
+        def _on_enter(_event):
+            right_canvas.focus_set()
+
+        right_canvas.bind("<Enter>", _on_enter)
+        right_canvas.bind("<MouseWheel>", _on_mousewheel)
+        right.bind("<MouseWheel>", _on_mousewheel)
+        self.root.bind_all("<MouseWheel>", _on_mousewheel)
+        self.root.bind_all("<Button-4>", _on_mousewheel)
+        self.root.bind_all("<Button-5>", _on_mousewheel)
         self.right_canvas = right_canvas
+
+        self.secure_overlay = tk.Frame(main, bg='#060a12')
+        self.secure_overlay_label = tk.Label(
+            self.secure_overlay,
+            text="",
+            font=('Bahnschrift', 20, 'bold'),
+            bg='#060a12',
+            fg=self.c['text'],
+            justify=tk.CENTER,
+        )
+        self.secure_overlay_label.pack(expand=True)
+        self.secure_overlay_desc = tk.Label(
+            self.secure_overlay,
+            text="",
+            font=('Segoe UI', 10),
+            bg='#060a12',
+            fg=self.c['dim'],
+            justify=tk.CENTER,
+        )
+        self.secure_overlay_desc.pack(pady=(0, 10))
+        self.secure_overlay.place_forget()
+
+        # === LOCAL FACE AUTH CARD ===
+        auth_card = tk.Frame(right, bg=self.c['card'], highlightbackground=self.c['border'], highlightthickness=1)
+        auth_card.pack(fill=tk.X, pady=(0, 8))
+        self.auth_card = auth_card
+        self._add_card_accent(auth_card, self.c['blue'], self.c['pink'])
+
+        auth_header = tk.Frame(auth_card, bg=self.c['card'])
+        auth_header.pack(fill=tk.X, padx=12, pady=(10, 6))
+
+        tk.Label(auth_header, text="🔐 Local Face Auth", font=('Bahnschrift', 12, 'bold'),
+            bg=self.c['card'], fg=self.c['text']).pack(side=tk.LEFT)
+
+        self.auth_status_lbl = tk.Label(auth_header, text="OFF", font=('Bahnschrift', 10, 'bold'),
+                         bg=self.c['card'], fg=self.c['dim'])
+        self.auth_status_lbl.pack(side=tk.RIGHT)
+
+        auth_body = tk.Frame(auth_card, bg=self.c['card'])
+        auth_body.pack(fill=tk.X, padx=12, pady=(0, 8))
+
+        tk.Label(auth_body, text="Profile", font=('Bahnschrift', 9), bg=self.c['card'], fg=self.c['dim']).grid(row=0, column=0, sticky='w')
+        self.face_name_entry = tk.Entry(auth_body, textvariable=self.face_auth_name_var, font=('Segoe UI', 10),
+                                        bg='#182033', fg=self.c['text'], insertbackground=self.c['text'], relief=tk.FLAT)
+        self.face_name_entry.grid(row=0, column=1, sticky='ew', padx=(8, 0))
+
+        self.auth_conf_lbl = tk.Label(auth_body, text="Confidence: --", font=('Bahnschrift', 9),
+                         bg=self.c['card'], fg=self.c['dim'])
+        self.auth_conf_lbl.grid(row=1, column=0, columnspan=2, sticky='w', pady=(6, 0))
+
+        self.auth_security_lbl = tk.Label(auth_body, text="Security: --", font=('Bahnschrift', 9),
+                         bg=self.c['card'], fg=self.c['dim'])
+        self.auth_security_lbl.grid(row=2, column=0, columnspan=2, sticky='w', pady=(2, 0))
+
+        self.auth_message_lbl = tk.Label(auth_body, text="Use the webcam to enroll the local user.", font=('Bahnschrift', 8),
+                         bg=self.c['card'], fg=self.c['dim'])
+        self.auth_message_lbl.grid(row=3, column=0, columnspan=2, sticky='w', pady=(2, 0))
+
+        auth_body.columnconfigure(1, weight=1)
+
+        auth_ctrl = tk.Frame(auth_card, bg=self.c['card'])
+        auth_ctrl.pack(fill=tk.X, padx=12, pady=(0, 10))
+
+        self.auth_toggle_btn = tk.Button(auth_ctrl, text="▶ ENABLE", font=('Bahnschrift', 9),
+                                         bg=self.c['green'], fg='white', relief=tk.FLAT,
+                                         command=self.toggle_face_auth, cursor='hand2')
+        self.auth_toggle_btn.pack(side=tk.LEFT, ipadx=8, ipady=2)
+
+        self.auth_enroll_btn = tk.Button(auth_ctrl, text="➕ Enroll", font=('Bahnschrift', 9),
+                                         bg='#20354f', fg=self.c['text'], relief=tk.FLAT,
+                                         command=self.enroll_face_profile, cursor='hand2')
+        self.auth_enroll_btn.pack(side=tk.LEFT, padx=(8, 0), ipadx=8, ipady=2)
+
+        self.auth_reset_btn = tk.Button(auth_ctrl, text="🗑 Reset", font=('Bahnschrift', 9),
+                                        bg='#20354f', fg=self.c['text'], relief=tk.FLAT,
+                                        command=self.reset_face_profiles, cursor='hand2')
+        self.auth_reset_btn.pack(side=tk.LEFT, padx=(8, 0), ipadx=8, ipady=2)
+
+        if not self.face_auth:
+            self.auth_toggle_btn.config(state=tk.DISABLED, bg=self.c['dim'])
+            self.auth_enroll_btn.config(state=tk.DISABLED, bg=self.c['dim'])
+            self.auth_reset_btn.config(state=tk.DISABLED, bg=self.c['dim'])
+            self.auth_message_lbl.config(text="Install OpenCV to enable local face auth.")
         
         # === FOCUS AI MODE CARD ===
-        focus_card = tk.Frame(right, bg='#1e3a5f', highlightbackground=self.c['blue'], highlightthickness=2)
+        focus_card = tk.Frame(right, bg=self.c['focus_bg'], highlightbackground=self.c['blue'], highlightthickness=2)
         focus_card.pack(fill=tk.X, pady=(0, 8))
         self.focus_card = focus_card
+        self._add_card_accent(focus_card, self.c['blue'], self.c['green'])
         
         # Focus header with toggle
-        focus_header = tk.Frame(focus_card, bg='#1e3a5f')
+        focus_header = tk.Frame(focus_card, bg=self.c['focus_bg'])
         focus_header.pack(fill=tk.X, padx=12, pady=8)
         
-        tk.Label(focus_header, text="🎯 Focus AI Mode", font=('Segoe UI', 12, 'bold'),
-                bg='#1e3a5f', fg=self.c['text']).pack(side=tk.LEFT)
+        tk.Label(focus_header, text="🎯 Focus AI Mode", font=('Bahnschrift', 12, 'bold'),
+            bg=self.c['focus_bg'], fg=self.c['text']).pack(side=tk.LEFT)
         
         self.focus_toggle_btn = tk.Button(focus_header, text="▶ START", font=('Segoe UI', 9, 'bold'),
                                           bg=self.c['green'], fg='white', relief=tk.FLAT,
                                           command=self.toggle_focus_mode, cursor='hand2')
         self.focus_toggle_btn.pack(side=tk.RIGHT, ipadx=8, ipady=2)
         
-        self.focus_status_lbl = tk.Label(focus_header, text="OFF", font=('Segoe UI', 10, 'bold'),
-                                         bg='#1e3a5f', fg=self.c['dim'])
+        self.focus_status_lbl = tk.Label(focus_header, text="OFF", font=('Bahnschrift', 10, 'bold'),
+                         bg=self.c['focus_bg'], fg=self.c['dim'])
         self.focus_status_lbl.pack(side=tk.RIGHT, padx=(0, 10))
         
         # Focus control buttons row
-        focus_ctrl_frame = tk.Frame(focus_card, bg='#1e3a5f')
+        focus_ctrl_frame = tk.Frame(focus_card, bg=self.c['focus_bg'])
         focus_ctrl_frame.pack(fill=tk.X, padx=12, pady=(0, 5))
         
-        self.focus_reset_btn = tk.Button(focus_ctrl_frame, text="🔄 Reset", font=('Segoe UI', 9),
-                                          bg='#2a4a6f', fg=self.c['text'], relief=tk.FLAT,
+        self.focus_reset_btn = tk.Button(focus_ctrl_frame, text="🔄 Reset", font=('Bahnschrift', 9),
+                          bg='#20354f', fg=self.c['text'], relief=tk.FLAT,
                                           command=self.reset_focus_mode, cursor='hand2')
         self.focus_reset_btn.pack(side=tk.LEFT, ipadx=8, ipady=2)
         
-        self.focus_export_btn = tk.Button(focus_ctrl_frame, text="📊 Export", font=('Segoe UI', 9),
-                                          bg='#2a4a6f', fg=self.c['text'], relief=tk.FLAT,
+        self.focus_export_btn = tk.Button(focus_ctrl_frame, text="📊 Export", font=('Bahnschrift', 9),
+                          bg='#20354f', fg=self.c['text'], relief=tk.FLAT,
                                           command=self.export_focus_data, cursor='hand2')
         self.focus_export_btn.pack(side=tk.LEFT, padx=(8, 0), ipadx=8, ipady=2)
         
         # Focus timer and duration
-        focus_timer_frame = tk.Frame(focus_card, bg='#1e3a5f')
+        focus_timer_frame = tk.Frame(focus_card, bg=self.c['focus_bg'])
         focus_timer_frame.pack(fill=tk.X, padx=12)
         
         self.focus_timer_lbl = tk.Label(focus_timer_frame, text="25:00", 
-                                        font=('Consolas', 28, 'bold'),
-                                        bg='#1e3a5f', fg=self.c['text'])
+                        font=('Bahnschrift', 30, 'bold'),
+                        bg=self.c['focus_bg'], fg=self.c['text'])
         self.focus_timer_lbl.pack(side=tk.LEFT)
         
         # Duration selector
-        dur_frame = tk.Frame(focus_timer_frame, bg='#1e3a5f')
+        dur_frame = tk.Frame(focus_timer_frame, bg=self.c['focus_bg'])
         dur_frame.pack(side=tk.RIGHT)
         
-        tk.Label(dur_frame, text="Duration:", font=('Segoe UI', 9),
-                bg='#1e3a5f', fg=self.c['dim']).pack(side=tk.LEFT, padx=(0, 5))
+        tk.Label(dur_frame, text="Duration:", font=('Bahnschrift', 9),
+            bg=self.c['focus_bg'], fg=self.c['dim']).pack(side=tk.LEFT, padx=(0, 5))
         
         self.focus_duration_var = tk.StringVar(value="25")
         duration_menu = ttk.Combobox(dur_frame, textvariable=self.focus_duration_var,
@@ -1004,7 +1197,7 @@ class MindShieldGUI:
         duration_menu.pack(side=tk.LEFT)
         
         # Focus metrics row
-        focus_metrics = tk.Frame(focus_card, bg='#1e3a5f')
+        focus_metrics = tk.Frame(focus_card, bg=self.c['focus_bg'])
         focus_metrics.pack(fill=tk.X, padx=12, pady=8)
         
         # Focus Score
@@ -1053,17 +1246,17 @@ class MindShieldGUI:
         self.distraction_log_text.pack(fill=tk.X, pady=(4, 0))
         
         # Focus Session Stats
-        focus_stats_frame = tk.Frame(focus_card, bg='#1e3a5f')
+        focus_stats_frame = tk.Frame(focus_card, bg=self.c['focus_bg'])
         focus_stats_frame.pack(fill=tk.X, padx=12, pady=(0, 10))
         
         self.focus_sessions_lbl = tk.Label(focus_stats_frame, text="Sessions: 0 | Total Focus: 0m",
-                                           font=('Segoe UI', 8), bg='#1e3a5f', fg=self.c['dim'],
+                           font=('Bahnschrift', 8), bg=self.c['focus_bg'], fg=self.c['dim'],
                                            cursor='hand2')
         self.focus_sessions_lbl.pack(side=tk.LEFT)
         self.focus_sessions_lbl.bind('<Button-1>', lambda e: self.show_session_history())
         
-        tk.Label(focus_stats_frame, text="  (click for details)", font=('Segoe UI', 7),
-                bg='#1e3a5f', fg='#4a6a8f').pack(side=tk.LEFT)
+        tk.Label(focus_stats_frame, text="  (click for details)", font=('Bahnschrift', 7),
+            bg=self.c['focus_bg'], fg='#4a6a8f').pack(side=tk.LEFT)
         
         # ===== Posture Detection Card =====
         posture_card = tk.Frame(right, bg=self.c['card'], highlightbackground=self.c['border'], highlightthickness=1)
@@ -1117,6 +1310,11 @@ class MindShieldGUI:
         self.posture_issues_lbl = tk.Label(posture_card, text="📷 Camera ready - Click START to monitor",
                                            font=('Segoe UI', 9), bg=self.c['card'], fg=self.c['dim'])
         self.posture_issues_lbl.pack(padx=12, pady=(0, 5))
+
+        # Posture change alert (small, orange)
+        self.posture_alert_lbl = tk.Label(posture_card, text="", font=('Segoe UI', 8),
+                          bg=self.c['card'], fg=self.c['orange'])
+        self.posture_alert_lbl.pack(padx=12, pady=(0, 6), anchor=tk.W)
         
         # Video preview frame
         preview_container = tk.Frame(posture_card, bg='#1a1a2e', relief=tk.SUNKEN, bd=1)
@@ -1139,7 +1337,7 @@ class MindShieldGUI:
         rec_card = tk.Frame(right, bg=self.c['card'], highlightbackground=self.c['border'], highlightthickness=1)
         rec_card.pack(fill=tk.X, pady=(0, 8))
         
-        tk.Label(rec_card, text="💡 Recommendations", font=('Segoe UI', 11, 'bold'),
+        tk.Label(rec_card, text="💡 Recommendations", font=('Bahnschrift', 11, 'bold'),
                 bg=self.c['card'], fg=self.c['text']).pack(anchor=tk.W, padx=12, pady=(10, 5))
         
         self.recs = []
@@ -1148,13 +1346,180 @@ class MindShieldGUI:
                           bg=self.c['card'], fg=self.c['text'], anchor=tk.W)
             lbl.pack(anchor=tk.W, padx=12, pady=1)
             self.recs.append(lbl)
+        self.rec_reason_lbl = tk.Label(rec_card, text="", font=('Bahnschrift', 8),
+                                       bg=self.c['card'], fg=self.c['dim'], anchor=tk.W)
+        self.rec_reason_lbl.pack(anchor=tk.W, padx=12, pady=(4, 4))
         tk.Frame(rec_card, height=8, bg=self.c['card']).pack()
+
+        # Explainable alert drivers
+        explain_card = tk.Frame(right, bg=self.c['card'], highlightbackground=self.c['border'], highlightthickness=1)
+        explain_card.pack(fill=tk.X, pady=(0, 8))
+
+        tk.Label(explain_card, text="🧭 Why This Alert?", font=('Bahnschrift', 11, 'bold'),
+                bg=self.c['card'], fg=self.c['text']).pack(anchor=tk.W, padx=12, pady=(10, 5))
+
+        self.alert_labels = []
+        for i in range(3):
+            lbl = tk.Label(explain_card, text="No active alerts", font=('Bahnschrift', 9),
+                          bg=self.c['card'], fg=self.c['dim'], anchor=tk.W)
+            lbl.pack(anchor=tk.W, padx=12, pady=1)
+            self.alert_labels.append(lbl)
+        tk.Frame(explain_card, height=6, bg=self.c['card']).pack()
+
+        # Daily analytics summary card
+        daily_card = tk.Frame(right, bg=self.c['card'], highlightbackground=self.c['border'], highlightthickness=1)
+        daily_card.pack(fill=tk.X, pady=(0, 8))
+
+        tk.Label(daily_card, text="📅 Today Summary", font=('Bahnschrift', 12, 'bold'),
+            bg=self.c['card'], fg=self.c['text']).pack(anchor=tk.W, padx=12, pady=(10, 5))
+
+        self.today_samples_lbl = tk.Label(daily_card, text="Samples: 0", font=('Bahnschrift', 10),
+                          bg=self.c['card'], fg=self.c['dim'])
+        self.today_samples_lbl.pack(anchor=tk.W, padx=12, pady=1)
+
+        self.today_risk_lbl = tk.Label(daily_card, text="Avg Risk: -- | Peak Risk: --", font=('Bahnschrift', 10),
+                           bg=self.c['card'], fg=self.c['text'])
+        self.today_risk_lbl.pack(anchor=tk.W, padx=12, pady=1)
+
+        self.today_focus_lbl = tk.Label(daily_card, text="Avg Focus: -- | Avg Confidence: --", font=('Bahnschrift', 10),
+                        bg=self.c['card'], fg=self.c['text'])
+        self.today_focus_lbl.pack(anchor=tk.W, padx=12, pady=(1, 8))
+
+        self.today_peak_lbl = tk.Label(daily_card, text="Best Focus Hour: --", font=('Bahnschrift', 10),
+                           bg=self.c['card'], fg=self.c['dim'])
+        self.today_peak_lbl.pack(anchor=tk.W, padx=12, pady=(0, 8))
+
+        # Privacy controls card
+        privacy_card = tk.Frame(right, bg=self.c['card'], highlightbackground=self.c['border'], highlightthickness=1)
+        privacy_card.pack(fill=tk.X, pady=(0, 8))
+        self._add_card_accent(privacy_card, self.c['pink'], self.c['blue'])
+
+        tk.Label(privacy_card, text="🛡 Privacy Control Room", font=('Bahnschrift', 12, 'bold'),
+            bg=self.c['card'], fg=self.c['text']).pack(anchor=tk.W, padx=12, pady=(10, 5))
+
+        self.privacy_status_lbl = tk.Label(privacy_card, text="Local-only active | Webcam on", font=('Bahnschrift', 10),
+                         bg=self.c['card'], fg=self.c['green'])
+        self.privacy_status_lbl.pack(anchor=tk.W, padx=12, pady=1)
+
+        privacy_btns = tk.Frame(privacy_card, bg=self.c['card'])
+        privacy_btns.pack(fill=tk.X, padx=12, pady=(4, 10))
+
+        self.pause_privacy_btn = tk.Button(privacy_btns, text="⏸ Pause AI", font=('Bahnschrift', 9),
+                                           bg='#20354f', fg=self.c['text'], relief=tk.FLAT,
+                                           command=self.toggle_privacy_pause, cursor='hand2')
+        self.pause_privacy_btn.pack(side=tk.LEFT, ipadx=8, ipady=2)
+
+        self.emotion_privacy_btn = tk.Button(privacy_btns, text="🧠 Emotion AI", font=('Bahnschrift', 9),
+                                             bg='#20354f', fg=self.c['text'], relief=tk.FLAT,
+                                             command=self.toggle_emotion_ai, cursor='hand2')
+        self.emotion_privacy_btn.pack(side=tk.LEFT, padx=(8, 0), ipadx=8, ipady=2)
+
+        self.webcam_privacy_btn = tk.Button(privacy_btns, text="📷 Webcam", font=('Bahnschrift', 9),
+                                            bg='#20354f', fg=self.c['text'], relief=tk.FLAT,
+                                            command=self.toggle_webcam_privacy, cursor='hand2')
+        self.webcam_privacy_btn.pack(side=tk.LEFT, padx=(8, 0), ipadx=8, ipady=2)
+
+        self.privacy_hint_lbl = tk.Label(privacy_card, text="No telemetry. All processing stays on-device.", font=('Bahnschrift', 8),
+                         bg=self.c['card'], fg=self.c['dim'])
+        self.privacy_hint_lbl.pack(anchor=tk.W, padx=12, pady=(0, 8))
+
+        # Emotion intelligence card
+        emotion_card = tk.Frame(right, bg=self.c['card'], highlightbackground=self.c['border'], highlightthickness=1)
+        emotion_card.pack(fill=tk.X, pady=(0, 8))
+        self._add_card_accent(emotion_card, self.c['orange'], self.c['pink'])
+
+        tk.Label(emotion_card, text="🫀 Emotional Signal", font=('Bahnschrift', 12, 'bold'),
+            bg=self.c['card'], fg=self.c['text']).pack(anchor=tk.W, padx=12, pady=(10, 5))
+
+        self.emotion_stress_lbl = tk.Label(emotion_card, text="Stress: --", font=('Bahnschrift', 10),
+                         bg=self.c['card'], fg=self.c['text'])
+        self.emotion_stress_lbl.pack(anchor=tk.W, padx=12, pady=1)
+
+        self.emotion_energy_lbl = tk.Label(emotion_card, text="Recovery: -- | Wellness: --", font=('Bahnschrift', 10),
+                         bg=self.c['card'], fg=self.c['text'])
+        self.emotion_energy_lbl.pack(anchor=tk.W, padx=12, pady=(1, 8))
+
+        # Burnout intelligence card
+        burnout_card = tk.Frame(right, bg=self.c['card'], highlightbackground=self.c['border'], highlightthickness=1)
+        burnout_card.pack(fill=tk.X, pady=(0, 8))
+        self._add_card_accent(burnout_card, self.c['red'], self.c['orange'])
+
+        tk.Label(burnout_card, text="🔥 Burnout Forecast", font=('Bahnschrift', 12, 'bold'),
+            bg=self.c['card'], fg=self.c['text']).pack(anchor=tk.W, padx=12, pady=(10, 5))
+
+        self.burnout_risk_lbl = tk.Label(burnout_card, text="Risk: -- | Trend: --", font=('Bahnschrift', 10),
+                         bg=self.c['card'], fg=self.c['text'])
+        self.burnout_risk_lbl.pack(anchor=tk.W, padx=12, pady=1)
+
+        self.burnout_recovery_lbl = tk.Label(burnout_card, text="Recovery: -- | Sustainability: --", font=('Bahnschrift', 10),
+                         bg=self.c['card'], fg=self.c['text'])
+        self.burnout_recovery_lbl.pack(anchor=tk.W, padx=12, pady=(1, 8))
+
+        # Forecast card
+        forecast_card = tk.Frame(right, bg=self.c['card'], highlightbackground=self.c['border'], highlightthickness=1)
+        forecast_card.pack(fill=tk.X, pady=(0, 8))
+        self._add_card_accent(forecast_card, self.c['blue'], self.c['pink'])
+
+        tk.Label(forecast_card, text="🔮 5-10 Min Forecast", font=('Bahnschrift', 12, 'bold'),
+            bg=self.c['card'], fg=self.c['text']).pack(anchor=tk.W, padx=12, pady=(10, 5))
+
+        self.forecast_focus_lbl = tk.Label(forecast_card, text="Focus: --%", font=('Bahnschrift', 10),
+                           bg=self.c['card'], fg=self.c['text'])
+        self.forecast_focus_lbl.pack(anchor=tk.W, padx=12, pady=1)
+
+        self.forecast_fatigue_lbl = tk.Label(forecast_card, text="Fatigue: --%", font=('Bahnschrift', 10),
+                             bg=self.c['card'], fg=self.c['text'])
+        self.forecast_fatigue_lbl.pack(anchor=tk.W, padx=12, pady=(1, 8))
+
+        # Gamification card
+        game_card = tk.Frame(right, bg=self.c['card'], highlightbackground=self.c['border'], highlightthickness=1)
+        game_card.pack(fill=tk.X, pady=(0, 8))
+        self._add_card_accent(game_card, self.c['green'], self.c['yellow'])
+
+        tk.Label(game_card, text="🏆 Focus Streaks", font=('Bahnschrift', 12, 'bold'),
+            bg=self.c['card'], fg=self.c['text']).pack(anchor=tk.W, padx=12, pady=(10, 5))
+
+        self.gamification_lbl = tk.Label(game_card, text="Level: Beginner | Streak: 0m", font=('Bahnschrift', 10),
+                         bg=self.c['card'], fg=self.c['text'])
+        self.gamification_lbl.pack(anchor=tk.W, padx=12, pady=1)
+
+        self.gamification_score_lbl = tk.Label(game_card, text="Productivity Score: 0", font=('Bahnschrift', 10),
+                               bg=self.c['card'], fg=self.c['dim'])
+        self.gamification_score_lbl.pack(anchor=tk.W, padx=12, pady=(1, 8))
+
+        self.streak_badge = tk.Label(game_card, text="🔥 Streak", font=('Bahnschrift', 10, 'bold'),
+                         bg=self.c['card'], fg=self.c['dim'])
+        self.streak_badge.pack(anchor=tk.W, padx=12, pady=(0, 8))
+
+        # AI Study Assistant card
+        study_card = tk.Frame(right, bg=self.c['card'], highlightbackground=self.c['border'], highlightthickness=1)
+        study_card.pack(fill=tk.X, pady=(0, 8))
+        self._add_card_accent(study_card, self.c['blue'], self.c['orange'])
+
+        study_header = tk.Frame(study_card, bg=self.c['card'])
+        study_header.pack(fill=tk.X, padx=12, pady=(10, 5))
+
+        tk.Label(study_header, text="📚 AI Study Assistant", font=('Bahnschrift', 12, 'bold'),
+            bg=self.c['card'], fg=self.c['text']).pack(side=tk.LEFT)
+
+        self.study_toggle_btn = tk.Button(study_header, text="OFF", font=('Bahnschrift', 9, 'bold'),
+                          bg=self.c['dim'], fg='white', relief=tk.FLAT,
+                          command=self.toggle_study_mode, cursor='hand2')
+        self.study_toggle_btn.pack(side=tk.RIGHT, ipadx=8)
+
+        self.study_status_lbl = tk.Label(study_card, text="Mode: Disabled", font=('Bahnschrift', 10),
+                         bg=self.c['card'], fg=self.c['dim'])
+        self.study_status_lbl.pack(anchor=tk.W, padx=12, pady=1)
+
+        self.study_cycle_lbl = tk.Label(study_card, text="Suggested cycle: --", font=('Bahnschrift', 10),
+                        bg=self.c['card'], fg=self.c['text'])
+        self.study_cycle_lbl.pack(anchor=tk.W, padx=12, pady=(1, 8))
         
         # App switches card
         switch_card = tk.Frame(right, bg=self.c['card'], highlightbackground=self.c['border'], highlightthickness=1)
         switch_card.pack(fill=tk.X, pady=(0, 8))
         
-        tk.Label(switch_card, text="🔄 Recent App Switches", font=('Segoe UI', 11, 'bold'),
+        tk.Label(switch_card, text="🔄 Recent App Switches", font=('Bahnschrift', 12, 'bold'),
                 bg=self.c['card'], fg=self.c['text']).pack(anchor=tk.W, padx=12, pady=(10, 5))
         
         self.switch_labels = []
@@ -1169,7 +1534,7 @@ class MindShieldGUI:
         graph_card = tk.Frame(right, bg=self.c['card'], highlightbackground=self.c['border'], highlightthickness=1)
         graph_card.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         
-        tk.Label(graph_card, text="📈 Real-Time Analysis", font=('Segoe UI', 11, 'bold'),
+        tk.Label(graph_card, text="📈 Real-Time Analysis", font=('Bahnschrift', 12, 'bold'),
                 bg=self.c['card'], fg=self.c['text']).pack(anchor=tk.W, padx=12, pady=(10, 5))
         
         # Graph legend
@@ -1184,7 +1549,7 @@ class MindShieldGUI:
         graph_frame = tk.Frame(graph_card, bg=self.c['bg'])
         graph_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(5, 10))
         
-        self.graph_canvas = tk.Canvas(graph_frame, bg=self.c['bg'], height=150, width=400,
+        self.graph_canvas = tk.Canvas(graph_frame, bg=self.c['bg'], height=180, width=400,
                                       highlightthickness=0)
         self.graph_canvas.pack(fill=tk.BOTH, expand=True)
         
@@ -1200,7 +1565,7 @@ class MindShieldGUI:
         tk.Label(log_card, text="📋 Log", font=('Segoe UI', 10, 'bold'),
                 bg=self.c['card'], fg=self.c['text']).pack(anchor=tk.W, padx=12, pady=(8, 3))
         
-        self.log = tk.Text(log_card, height=3, font=('Consolas', 8),
+        self.log = tk.Text(log_card, height=4, font=('Consolas', 8),
                           bg=self.c['bg'], fg=self.c['green'], relief=tk.FLAT,
                           wrap=tk.WORD, state=tk.DISABLED)
         self.log.pack(fill=tk.X, padx=12, pady=(0, 8))
@@ -1261,18 +1626,237 @@ class MindShieldGUI:
         self.capture = SystemBehaviorCapture()
         self.capture.start()
         self.engine = MindShieldEngine()
+        self._refresh_daily_summary()
         
         self.start_btn.config(text="⏹ Stop", bg=self.c['red'])
         self.status.config(text="● Monitoring", fg=self.c['green'])
+        self.status_badge.config(text="LIVE", bg=self.c['blue'], fg='white')
         self.add_log("✅ Started monitoring")
         
     def stop(self):
         self.monitoring = False
         if self.capture:
             self.capture.stop()
+        self._set_secure_overlay(False)
         self.start_btn.config(text="▶ Start", bg=self.c['green'])
         self.status.config(text="● Stopped", fg=self.c['red'])
+        self.status_badge.config(text="OFFLINE", bg=self.c['border'], fg=self.c['dim'])
         self.add_log("⏹ Stopped")
+
+    def toggle_privacy_pause(self):
+        """Pause or resume the local AI loop."""
+        self.privacy.pause(not self.privacy.settings.paused)
+        if self.privacy.settings.paused:
+            self.add_log("⏸ Local AI paused")
+            self.privacy_status_lbl.config(text="Local-only active | Paused", fg=self.c['yellow'])
+        else:
+            self.add_log("▶ Local AI resumed")
+
+    def toggle_emotion_ai(self):
+        """Enable or disable emotion intelligence locally."""
+        enabled = not self.privacy.settings.emotion_ai_enabled
+        self.privacy.toggle_emotion_ai(enabled)
+        self.add_log(f"🧠 Emotion AI {'enabled' if enabled else 'disabled'}")
+
+    def toggle_webcam_privacy(self):
+        """Enable or disable webcam-based monitoring features."""
+        enabled = not self.privacy.settings.webcam_enabled
+        self.privacy.toggle_webcam(enabled)
+        if not enabled:
+            self.add_log("📷 Webcam disabled")
+            if self.posture_enabled:
+                self.stop_posture()
+            self.face_auth_enabled = False
+            self.face_auth_locked = False
+            self._set_secure_overlay(False)
+        else:
+            self.add_log("📷 Webcam enabled")
+
+    def toggle_face_auth(self):
+        """Enable or disable local face authentication."""
+        if not self.face_auth:
+            messagebox.showerror("Local Face Auth", "Local face authentication is unavailable.")
+            return
+
+        if not self.posture_detector:
+            messagebox.showerror("Local Face Auth", "Webcam monitoring is required for local face authentication.")
+            return
+
+        if self.face_auth_enabled:
+            self.face_auth_enabled = False
+            self.face_auth_locked = False
+            self._set_secure_overlay(False)
+            self.auth_toggle_btn.config(text="▶ ENABLE", bg=self.c['green'])
+            self.auth_status_lbl.config(text="OFF", fg=self.c['dim'])
+            self.auth_message_lbl.config(text="Local face auth disabled.", fg=self.c['dim'])
+            self.status_badge.config(text="LIVE", bg=self.c['blue'], fg='white' if self.monitoring else self.c['dim'])
+            self.add_log("🔓 Local face auth disabled")
+            return
+
+        if self.posture_detector and not self.posture_enabled:
+            self.start_posture()
+            if not self.posture_enabled:
+                messagebox.showerror("Local Face Auth", "Start webcam/posture monitoring first so the app can see your face.")
+                return
+
+        self.face_auth_enabled = True
+        self.face_auth_locked = True if not (self.face_auth and self.face_auth.enrolled_profiles) else False
+        self.auth_toggle_btn.config(text="⏹ LOCKED", bg=self.c['orange'])
+        self.auth_status_lbl.config(text="ON", fg=self.c['green'])
+        self.auth_message_lbl.config(text="Show your face to unlock the dashboard.", fg=self.c['dim'])
+        self.add_log("🔐 Local face auth enabled")
+
+    def enroll_face_profile(self):
+        """Enroll the current webcam face as the local trusted user."""
+        if self.face_auth_enroll_in_progress:
+            return
+        if not self.face_auth:
+            messagebox.showerror("Local Face Auth", "Face authentication is unavailable.")
+            return
+
+        if self.last_camera_frame is None:
+            messagebox.showinfo("Enroll Face", "Start webcam monitoring first so the app can capture a face frame.")
+            return
+
+        name = self.face_auth_name_var.get().strip() or "Primary User"
+        self.face_auth_enroll_in_progress = True
+        self.auth_enroll_btn.config(state=tk.DISABLED, bg=self.c['dim'])
+        self.auth_message_lbl.config(text="Enrolling...", fg=self.c['dim'])
+
+        threading.Thread(
+            target=self._run_face_enroll,
+            args=(name,),
+            daemon=True,
+        ).start()
+
+    def _run_face_enroll(self, name: str) -> None:
+        ok = False
+        msg = "No face detected for enrollment"
+        for _ in range(12):
+            frame = self.last_camera_frame
+            if frame is None:
+                time.sleep(0.2)
+                continue
+            ok, msg = self.face_auth.enroll(name, frame)
+            if ok:
+                break
+            if msg not in {"No face detected for enrollment", "Face crop failed"}:
+                break
+            time.sleep(0.2)
+        self.root.after(0, lambda: self._finish_face_enroll(ok, msg, name))
+
+    def _finish_face_enroll(self, ok: bool, msg: str, name: str) -> None:
+        self.face_auth_enroll_in_progress = False
+        self.auth_enroll_btn.config(state=tk.NORMAL, bg='#20354f')
+        if ok:
+            self.face_auth_enabled = True
+            self.face_auth_locked = False
+            self._set_secure_overlay(False)
+            self.auth_status_lbl.config(text=f"ON • {name}", fg=self.c['green'])
+            self.auth_message_lbl.config(text=msg, fg=self.c['green'])
+            self.add_log(f"✅ {msg}")
+        else:
+            self.auth_message_lbl.config(text=msg, fg=self.c['orange'])
+            messagebox.showerror("Enroll Face", msg)
+
+    def reset_face_profiles(self):
+        """Remove all stored local face profiles."""
+        if not self.face_auth:
+            return
+
+        if not messagebox.askyesno("Reset Face Profiles", "Delete all local face profiles from this device?"):
+            return
+
+        self.face_auth.delete_all_profiles()
+        self.face_auth_enabled = False
+        self.face_auth_locked = False
+        self._set_secure_overlay(False)
+        self.auth_toggle_btn.config(text="▶ ENABLE", bg=self.c['green'])
+        self.auth_status_lbl.config(text="OFF", fg=self.c['dim'])
+        self.auth_conf_lbl.config(text="Confidence: --", fg=self.c['dim'])
+        self.auth_security_lbl.config(text="Security: --", fg=self.c['dim'])
+        self.auth_message_lbl.config(text="Local face profiles cleared.", fg=self.c['dim'])
+        self.add_log("🗑 Local face profiles cleared")
+
+    def _set_secure_overlay(self, locked: bool, result=None):
+        """Show or hide the secure-session overlay."""
+        self.face_auth_locked = locked
+        if locked:
+            status_text = "Secure Session Locked"
+            message = "Authorized face required to continue monitoring."
+            if result:
+                if result.status == "ABSENT":
+                    message = "No face detected. Sit in front of the webcam to unlock."
+                elif result.status == "NEEDS_ENROLLMENT":
+                    message = "Enroll this device user to begin local face authentication."
+                elif result.message:
+                    message = result.message
+            self.secure_overlay_label.config(text=status_text)
+            self.secure_overlay_desc.config(text=message)
+            self.secure_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+            self.secure_overlay.lift()
+            self.status_badge.config(text="LOCKED", bg=self.c['orange'], fg='white')
+        else:
+            self.secure_overlay.place_forget()
+            if self.monitoring:
+                self.status_badge.config(text="LIVE", bg=self.c['blue'], fg='white')
+
+    def _update_face_auth_ui(self, result):
+        """Render local face-auth state in the dashboard."""
+        self.face_auth_state = result
+        now = time.time()
+        if result.face_visible:
+            self.face_auth_last_seen_ts = now
+        self.auth_conf_lbl.config(text=f"Confidence: {result.confidence:.0f}%")
+        self.auth_security_lbl.config(text=f"Security: {result.security_score:.0f}%")
+
+        if self.face_auth_locked and result.status != "AUTHORIZED":
+            self.auth_status_lbl.config(text="LOCKED", fg=self.c['orange'])
+            self.auth_message_lbl.config(text="Show your face to unlock.", fg=self.c['orange'])
+            self.auth_toggle_btn.config(text="⏹ LOCKED", bg=self.c['orange'])
+            self._set_secure_overlay(True, result)
+            return
+
+        if result.status != "AUTHORIZED" and (now - self.face_auth_last_auth_ts) < self.face_auth_grace_seconds:
+            self.auth_status_lbl.config(text="ON • Trusted", fg=self.c['green'])
+            self.auth_message_lbl.config(text="Rechecking face...", fg=self.c['green'])
+            self.auth_toggle_btn.config(text="✅ ACTIVE", bg=self.c['green'])
+            self._set_secure_overlay(False, result)
+            return
+
+        if result.status == "AUTHORIZED":
+            self.face_auth_last_auth_ts = now
+            self.face_auth_unknown_since = 0.0
+            self.auth_status_lbl.config(text=f"ON • {result.profile_name or 'Trusted'}", fg=self.c['green'])
+            self.auth_message_lbl.config(text=result.message or "Authorized", fg=self.c['green'])
+            self.auth_toggle_btn.config(text="✅ ACTIVE", bg=self.c['green'])
+            self._set_secure_overlay(False, result)
+        elif result.status == "NEEDS_ENROLLMENT":
+            self.face_auth_unknown_since = 0.0
+            self.auth_status_lbl.config(text="ENROLL", fg=self.c['yellow'])
+            self.auth_message_lbl.config(text=result.message or "Enroll a face profile.", fg=self.c['yellow'])
+            self.auth_toggle_btn.config(text="⏹ LOCKED", bg=self.c['orange'])
+            self._set_secure_overlay(True, result)
+        elif result.status == "ABSENT":
+            self.auth_status_lbl.config(text="ABSENT", fg=self.c['orange'])
+            self.auth_message_lbl.config(text=result.message or "Face not visible.", fg=self.c['orange'])
+            should_lock = (
+                (now - self.face_auth_last_seen_ts) >= self.face_auth_absent_seconds
+                and (now - self.face_auth_last_auth_ts) >= self.face_auth_grace_seconds
+            )
+            self.auth_toggle_btn.config(text="⏹ LOCKED" if should_lock else "✅ ACTIVE", bg=self.c['orange'])
+            self._set_secure_overlay(should_lock, result)
+        else:
+            if self.face_auth_unknown_since == 0.0:
+                self.face_auth_unknown_since = now
+            self.auth_status_lbl.config(text="CHECK", fg=self.c['orange'])
+            self.auth_message_lbl.config(text=result.message or "Unknown face detected.", fg=self.c['orange'])
+            should_lock = (
+                (now - self.face_auth_unknown_since) >= self.face_auth_unknown_seconds
+                and (now - self.face_auth_last_auth_ts) >= self.face_auth_grace_seconds
+            )
+            self.auth_toggle_btn.config(text="⏹ LOCKED" if should_lock else "✅ ACTIVE", bg=self.c['orange'])
+            self._set_secure_overlay(should_lock, result)
     
     # ========== FOCUS MODE METHODS ==========
     
@@ -1373,6 +1957,35 @@ class MindShieldGUI:
         self.focus_sessions_lbl.config(text="Sessions: 0 | Total Focus: 0m")
         
         self.add_log("🔄 Focus Mode reset")
+
+    # ===== STUDY ASSISTANT =====
+
+    def toggle_study_mode(self):
+        self.study_mode_enabled = not self.study_mode_enabled
+        if self.study_mode_enabled:
+            self.study_toggle_btn.config(text="ON", bg=self.c['blue'])
+            self.study_status_lbl.config(text="Mode: Adaptive Pomodoro", fg=self.c['text'])
+            self.add_log("📚 Study Assistant enabled")
+        else:
+            self.study_toggle_btn.config(text="OFF", bg=self.c['dim'])
+            self.study_status_lbl.config(text="Mode: Disabled", fg=self.c['dim'])
+            self.study_cycle_lbl.config(text="Suggested cycle: --")
+            self.add_log("📚 Study Assistant disabled")
+
+    def _update_study_plan(self, analysis: Dict):
+        if not self.study_mode_enabled:
+            return
+        fatigue = float(analysis.get('fatigue_prob', 0))
+        focus = float(analysis.get('focus_score', 0))
+
+        if fatigue >= 65:
+            cycle = "20 min focus / 5 min break"
+        elif focus >= 75:
+            cycle = "50 min focus / 10 min break"
+        else:
+            cycle = "25 min focus / 5 min break"
+
+        self.study_cycle_lbl.config(text=f"Suggested cycle: {cycle}")
     
     def _update_focus_stats(self):
         """Update focus session statistics display."""
@@ -1481,21 +2094,37 @@ class MindShieldGUI:
                 fg=self.c['green'] if stats['good_percentage'] > 70 else self.c['yellow']
             )
             self.add_log(f"🧘 Posture stopped - {stats['good_percentage']:.0f}% good")
+
+        if self.face_auth_enabled:
+            self._set_secure_overlay(True, self.face_auth_state)
     
-    def _on_posture_update(self, status, frame=None):
+    def _on_posture_update(self, status, frame=None, raw_frame=None):
         """Callback for posture updates (from background thread)."""
         # Schedule UI update on main thread
-        self.root.after(0, lambda s=status, f=frame: self._update_posture_ui(s, f))
+        self.root.after(0, lambda s=status, f=frame, rf=raw_frame: self._update_posture_ui(s, f, rf))
     
-    def _update_posture_ui(self, status, frame=None):
+    def _update_posture_ui(self, status, frame=None, raw_frame=None):
         """Update posture UI elements."""
         if not self.posture_enabled:
             return
+
+        if raw_frame is not None:
+            self.last_camera_frame = raw_frame
+        else:
+            self.last_camera_frame = frame
+
+        if self.face_auth and self.face_auth_enabled and self.last_camera_frame is not None:
+            try:
+                presence = self.face_auth.verify_frame(self.last_camera_frame)
+                self._update_face_auth_ui(presence)
+            except Exception as e:
+                self.add_log(f"⚠️ Face auth error: {e}")
         
         # Update score
         score = status.score
         score_color = self.c['green'] if score >= 70 else self.c['yellow'] if score >= 40 else self.c['red']
         self.posture_score_lbl.config(text=f"{score:.0f}", fg=score_color)
+        self.latest_posture_score = score
         
         # Update times
         if self.posture_detector:
@@ -1509,6 +2138,14 @@ class MindShieldGUI:
         if frame is not None:
             self._update_posture_preview(frame, status)
         
+        # Detect posture change and show small alert
+        if status.confidence > 0.5:
+            if self.last_posture_good is None:
+                self.last_posture_good = status.is_good
+            elif status.is_good != self.last_posture_good:
+                self.last_posture_good = status.is_good
+                self._flash_posture_change_alert("Posture changed")
+
         # Update issues
         if status.issues and status.issues[0] != "No person detected":
             issues_text = " | ".join(status.issues[:2])
@@ -1523,6 +2160,11 @@ class MindShieldGUI:
             self.posture_issues_lbl.config(text="✓ Good posture! Keep it up!", fg=self.c['green'])
         else:
             self.posture_issues_lbl.config(text="📷 Looking for you...", fg=self.c['dim'])
+
+    def _flash_posture_change_alert(self, message: str):
+        """Show a small orange posture-change alert briefly."""
+        self.posture_alert_lbl.config(text=f"⚠️ {message}")
+        self.root.after(3000, lambda: self.posture_alert_lbl.config(text=""))
     
     def _show_posture_alert(self, issues: str):
         """Show posture correction alert."""
@@ -1654,9 +2296,18 @@ class MindShieldGUI:
             if window_title:
                 result = self.focus_session.check_window_distraction(window_title)
                 
-                if result.get('is_distraction') and result.get('show_warning'):
-                    self.show_distraction_warning(result.get('site', window_title))
-                    self.add_log(f"⚠️ Distraction: {result.get('site', '')[:25]}")
+                if result.get('is_distraction'):
+                    if not self.focus_warning_window:
+                        self.show_distraction_warning(result.get('site', window_title))
+                    if result.get('show_warning'):
+                        self.add_log(f"⚠️ Distraction: {result.get('site', '')[:25]}")
+                else:
+                    if self.focus_warning_window:
+                        try:
+                            self.focus_warning_window.destroy()
+                        except:
+                            pass
+                        self.focus_warning_window = None
                 
                 # Check if session ended
                 if result.get('session_ended'):
@@ -1744,9 +2395,6 @@ class MindShieldGUI:
                  font=('Segoe UI', 11, 'bold'),
                  bg='#28a745', fg='white', relief=tk.FLAT,
                  command=warning.destroy, cursor='hand2').pack(side=tk.LEFT, padx=5, ipadx=15, ipady=5)
-        
-        # Auto-close after 8 seconds
-        warning.after(8000, warning.destroy)
         
         # Bring to front
         warning.lift()
@@ -1908,10 +2556,17 @@ class MindShieldGUI:
             messagebox.showinfo("Export", "No data yet")
             return
         
+        today_summary = self.session_store.get_today_summary()
         export_data = {
             'analysis_history': list(self.engine.history),
             'focus_sessions': self.focus_session.completed_sessions,
             'total_focus_time': self.focus_session.total_focus_time,
+            'today_summary': today_summary,
+            'baseline_profile': {
+                'sample_count': self.baseline_manager.sample_count,
+                'calibrated': self.baseline_manager.is_calibrated,
+                'calibration_target': self.baseline_manager.calibration_samples,
+            },
             'exported_at': datetime.now().isoformat()
         }
         
@@ -1931,6 +2586,43 @@ class MindShieldGUI:
         self.log.insert(tk.END, f"[{ts}] {msg}\n")
         self.log.see(tk.END)
         self.log.config(state=tk.DISABLED)
+
+    def _add_card_accent(self, card: tk.Frame, left_color: str, right_color: str):
+        """Add a thin accent bar to a card to simulate gradient energy."""
+        bar = tk.Frame(card, bg=left_color, height=4)
+        bar.pack(fill=tk.X, side=tk.TOP)
+        right = tk.Frame(bar, bg=right_color)
+        right.place(relx=0.5, rely=0, relwidth=0.5, relheight=1)
+
+    def _start_risk_pulse(self):
+        if self._risk_pulse_active:
+            return
+        self._risk_pulse_active = True
+        self._risk_pulse_tick()
+
+    def _risk_pulse_tick(self):
+        if not self._risk_pulse_active:
+            return
+        self._risk_pulse_on = not self._risk_pulse_on
+        color = self.c['red'] if self._risk_pulse_on else self.c['pink']
+        self.risk_card.config(highlightbackground=color)
+        self.risk_val.config(fg=color)
+        self._risk_pulse_job = self.root.after(450, self._risk_pulse_tick)
+
+    def _stop_risk_pulse(self, normal_color: str):
+        if not self._risk_pulse_active:
+            self.risk_card.config(highlightbackground=self.c['border'])
+            self.risk_val.config(fg=normal_color)
+            return
+        self._risk_pulse_active = False
+        if self._risk_pulse_job:
+            try:
+                self.root.after_cancel(self._risk_pulse_job)
+            except:
+                pass
+            self._risk_pulse_job = None
+        self.risk_card.config(highlightbackground=self.c['border'])
+        self.risk_val.config(fg=normal_color)
         
     def color_for(self, val, invert=False):
         if invert:
@@ -1971,7 +2663,7 @@ class MindShieldGUI:
         
         # Draw background fill
         canvas.create_rectangle(padding_left, padding_top, w - padding_right, h - padding_bottom,
-                               fill='#0d1117', outline=self.c['border'])
+                       fill=self.c['bg'], outline=self.c['border'])
         
         # Draw background grid
         for i in range(5):
@@ -1981,7 +2673,7 @@ class MindShieldGUI:
             # Y-axis labels
             val = 100 - (i * 25)
             canvas.create_text(padding_left - 5, y, text=str(val), 
-                             font=('Segoe UI', 7), fill=self.c['dim'], anchor=tk.E)
+                             font=('Bahnschrift', 8), fill=self.c['dim'], anchor=tk.E)
         
         # Draw vertical axis
         canvas.create_line(padding_left, padding_top, padding_left, h - padding_bottom,
@@ -1993,7 +2685,7 @@ class MindShieldGUI:
         if not has_data:
             # Show message when no data
             canvas.create_text(w // 2, h // 2, text="Start monitoring to see real-time data",
-                             font=('Segoe UI', 9), fill=self.c['dim'], anchor=tk.CENTER)
+                             font=('Bahnschrift', 10), fill=self.c['dim'], anchor=tk.CENTER)
             return
         
         # Draw data lines
@@ -2033,6 +2725,18 @@ class MindShieldGUI:
         risk = analysis['risk_score']
         self.risk_val.config(text=f"{risk:.0f}", fg=self.color_for(risk))
         self.risk_lvl.config(text=analysis['risk_level'], fg=self.color_for(risk))
+
+        # Risk progress bar update
+        bar_w = self.risk_bar.winfo_width() or 200
+        fill_w = int(bar_w * min(max(risk, 0), 100) / 100)
+        self.risk_bar.coords(self.risk_bar_fill, 0, 0, fill_w, 8)
+        self.risk_bar.itemconfig(self.risk_bar_fill, fill=self.color_for(risk))
+
+        # Critical pulse
+        if risk >= 75:
+            self._start_risk_pulse()
+        else:
+            self._stop_risk_pulse(self.color_for(risk))
         
         # Trend
         trend = analysis.get('trend', 'stable')
@@ -2048,6 +2752,8 @@ class MindShieldGUI:
                                          fg=self.color_for(analysis['cognitive_load']))
         self.metrics['fatigue'].config(text=f"{analysis['fatigue_prob']:.0f}%",
                                        fg=self.color_for(analysis['fatigue_prob']))
+        self.metrics['state'].config(text=f"{analysis.get('cognitive_state', 0):.0f}%",
+                         fg=self.color_for(analysis.get('cognitive_state', 0)))
         self.metrics['focus'].config(text=f"{analysis['focus_score']:.0f}%",
                                      fg=self.color_for(analysis['focus_score'], True))
         self.metrics['productivity'].config(text=f"{analysis['productivity']:.0f}%",
@@ -2056,8 +2762,44 @@ class MindShieldGUI:
                                      fg=self.color_for(analysis['behavioral_drift']))
         self.metrics['eye_strain'].config(text=f"{analysis['eye_strain']:.0f}%",
                                           fg=self.color_for(analysis['eye_strain']))
+        confidence = analysis.get('confidence', 0)
+        self.metrics['confidence'].config(text=f"{confidence:.0f}%",
+                          fg=self.color_for(100 - confidence))
         self.metrics['typing'].config(text=f"{metrics.get('typing_speed_wpm', 0):.1f} WPM")
         self.metrics['errors'].config(text=f"{metrics.get('error_count', 0)}")
+
+        emotion = analysis.get('emotion_state', {})
+        if emotion:
+            self.emotion_stress_lbl.config(
+                text=f"Stress: {emotion.get('stress', 0):.0f}% | Frustration: {emotion.get('frustration', 0):.0f}%",
+                fg=self.color_for(emotion.get('stress', 0)),
+            )
+            self.emotion_energy_lbl.config(
+                text=f"Recovery: {emotion.get('recovery', 0):.0f}% | Wellness: {emotion.get('wellness', 0):.0f}%",
+                fg=self.color_for(emotion.get('wellness', 0), True),
+            )
+
+        burnout = analysis.get('burnout_state', {})
+        if burnout:
+            self.burnout_risk_lbl.config(
+                text=f"Risk: {burnout.get('burnout_risk', 0):.0f}% | Trend: {burnout.get('trend', 'stable').title()}",
+                fg=self.color_for(burnout.get('burnout_risk', 0)),
+            )
+            self.burnout_recovery_lbl.config(
+                text=f"Recovery: {burnout.get('recovery_quality', 0):.0f}% | Sustainability: {burnout.get('sustainability_score', 0):.0f}%",
+                fg=self.color_for(burnout.get('sustainability_score', 0), True),
+            )
+
+        privacy = self.privacy.as_dict()
+        privacy_text = ["Local-only active"]
+        privacy_text.append("Webcam on" if privacy.get('webcam_enabled', True) else "Webcam off")
+        privacy_text.append("Emotion AI on" if privacy.get('emotion_ai_enabled', False) else "Emotion AI off")
+        if privacy.get('paused'):
+            privacy_text.append("Paused")
+        self.privacy_status_lbl.config(text=" | ".join(privacy_text), fg=self.c['yellow'] if privacy.get('paused') else self.c['green'])
+        self.pause_privacy_btn.config(text="▶ Resume AI" if privacy.get('paused') else "⏸ Pause AI")
+        self.emotion_privacy_btn.config(text="🧠 Emotion AI ON" if privacy.get('emotion_ai_enabled') else "🧠 Emotion AI OFF")
+        self.webcam_privacy_btn.config(text="📷 Webcam ON" if privacy.get('webcam_enabled') else "📷 Webcam OFF")
         
         # Timer
         dur = metrics.get('session_duration', 0)
@@ -2076,6 +2818,59 @@ class MindShieldGUI:
         recs = analysis.get('recommendations', [])
         for i, lbl in enumerate(self.recs):
             lbl.config(text=recs[i] if i < len(recs) else "")
+        reasons = analysis.get('decision_reasons', [])
+        if reasons:
+            self.rec_reason_lbl.config(text=f"Why: {', '.join(reasons[:2])}")
+        else:
+            self.rec_reason_lbl.config(text="")
+
+        # Forecast
+        forecast = analysis.get('forecast', {})
+        if forecast:
+            f5 = forecast.get('focus_5m', None)
+            f10 = forecast.get('focus_10m', None)
+            fa5 = forecast.get('fatigue_5m', None)
+            fa10 = forecast.get('fatigue_10m', None)
+            if f5 is None or f10 is None or fa5 is None or fa10 is None:
+                self.forecast_focus_lbl.config(text="Focus: --% / --%")
+                self.forecast_fatigue_lbl.config(text="Fatigue: --% / --%")
+            else:
+                self.forecast_focus_lbl.config(text=f"Focus: {f5:.0f}% / {f10:.0f}%")
+                self.forecast_fatigue_lbl.config(text=f"Fatigue: {fa5:.0f}% / {fa10:.0f}%")
+
+        # Gamification
+        game = analysis.get('gamification', {})
+        if game and not isinstance(game, dict):
+            if hasattr(game, 'as_dict'):
+                game = game.as_dict()
+            else:
+                try:
+                    game = dict(game.__dict__)
+                except Exception:
+                    game = {}
+        if game:
+            streak_min = float(game.get('focus_streak_minutes', game.get('focus_streak', 0)))
+            self.gamification_lbl.config(text=f"Level: {game.get('level', 'Beginner')} | Streak: {streak_min:.1f}m")
+            self.gamification_score_lbl.config(text=f"Productivity Score: {game.get('productivity_score', 0):.0f}")
+            streak = float(streak_min)
+            if streak >= 3:
+                self._streak_pulse_on = not self._streak_pulse_on
+                badge_color = self.c['orange'] if self._streak_pulse_on else self.c['yellow']
+                self.streak_badge.config(text=f"🔥 Streak {streak:.1f}m", fg=badge_color)
+            else:
+                self.streak_badge.config(text="🔥 Streak", fg=self.c['dim'])
+
+        # Explainable alert drivers
+        alert_trigger = analysis.get('risk_score', 0) >= 50 or analysis.get('risk_level') in ("HIGH", "CRITICAL")
+        if alert_trigger:
+            baseline = self.baseline_manager.get_baseline_stats()
+            drivers = build_alert_explanations(baseline, metrics)
+            for i, lbl in enumerate(self.alert_labels):
+                text = drivers[i] if i < len(drivers) else ""
+                lbl.config(text=text, fg=self.c['orange'])
+        else:
+            for i, lbl in enumerate(self.alert_labels):
+                lbl.config(text="No active alerts" if i == 0 else "", fg=self.c['dim'])
             
         # App switches
         recent = metrics.get('recent_switches', [])
@@ -2094,6 +2889,26 @@ class MindShieldGUI:
         
         # Draw the graph
         self.draw_graph()
+
+        # Calibration state hint in trend line for easy onboarding feedback
+        progress = analysis.get('calibration_progress', 100)
+        if progress < 100:
+            self.trend_lbl.config(text=f"🧪 Calibrating profile: {progress}%", fg=self.c['blue'])
+
+    def _refresh_daily_summary(self):
+        """Refresh daily summary section from local analytics store."""
+        summary = self.session_store.get_today_summary()
+        best_hour = self.session_store.get_best_focus_hour()
+        self.today_samples_lbl.config(text=f"Samples: {summary['samples']}")
+        self.today_risk_lbl.config(
+            text=f"Avg Risk: {summary['avg_risk']:.1f} | Peak Risk: {summary['peak_risk']:.1f}",
+            fg=self.color_for(summary['avg_risk'])
+        )
+        self.today_focus_lbl.config(
+            text=f"Avg Focus: {summary['avg_focus']:.1f} | Avg Confidence: {summary['avg_confidence']:.1f}",
+            fg=self.c['text']
+        )
+        self.today_peak_lbl.config(text=f"Best Focus Hour: {best_hour}:00")
     
     def _check_break_reminders(self, analysis: Dict, metrics: Dict):
         """Smart break reminders based on fatigue and time."""
@@ -2156,8 +2971,70 @@ class MindShieldGUI:
     def _update_loop(self):
         if self.monitoring and self.capture:
             try:
+                if self.privacy.settings.paused:
+                    self.privacy_status_lbl.config(text="Local-only active | Paused", fg=self.c['yellow'])
+                    self.root.after(500, self._update_loop)
+                    return
+
+                if self.face_auth_enabled and self.face_auth_locked:
+                    self._set_secure_overlay(True, self.face_auth_state)
+                    self.root.after(1000, self._update_loop)
+                    return
+
                 metrics = self.capture.get_metrics()
+                if self.latest_posture_score is not None:
+                    metrics['posture_score'] = self.latest_posture_score
                 analysis = self.engine.analyze(metrics)
+
+                # Learn personal baseline continuously and adapt scoring confidence.
+                self.baseline_manager.update(metrics)
+                analysis = self.baseline_manager.adapt_analysis(analysis, metrics)
+
+                # Generate intervention recommendations with richer context.
+                interventions = self.intervention_engine.recommend(
+                    analysis,
+                    metrics,
+                    focus_active=self.focus_session.is_active,
+                    posture_enabled=self.posture_enabled,
+                )
+                default_recs = [f"{i.icon} {i.message}" for i in interventions]
+
+                # Hybrid decision engine recommendations + explainability reasons.
+                try:
+                    recs, reasons = generate_recommendations(analysis, metrics)
+                    if len(recs) < 3:
+                        for r in default_recs:
+                            if r not in recs:
+                                recs.append(r)
+                            if len(recs) >= 3:
+                                break
+                    analysis['recommendations'] = recs
+                    analysis['decision_reasons'] = reasons
+                except Exception as e:
+                    analysis['recommendations'] = default_recs[:3]
+                    analysis['decision_reasons'] = []
+                    self.add_log(f"⚠️ Decision engine error: {e}")
+
+                # Unified cognitive state (multi-modal fusion)
+                posture_score = float(metrics.get('posture_score', 70))
+                posture_strain = max(0.0, 100.0 - posture_score)
+                cognitive_state = 0.5 * analysis.get('risk_score', 0) + 0.3 * analysis.get('cognitive_load', 0) + 0.2 * posture_strain
+                analysis['cognitive_state'] = max(0.0, min(100.0, cognitive_state))
+
+                # Short-term forecast (5-10 minutes)
+                try:
+                    forecast_5m = forecast_metrics(list(self.engine.history), ['focus_score', 'fatigue_prob'], seconds_ahead=300)
+                    forecast_10m = forecast_metrics(list(self.engine.history), ['focus_score', 'fatigue_prob'], seconds_ahead=600)
+                    analysis['forecast'] = {
+                        'focus_5m': forecast_5m.get('focus_score', None),
+                        'fatigue_5m': forecast_5m.get('fatigue_prob', None),
+                        'focus_10m': forecast_10m.get('focus_score', None),
+                        'fatigue_10m': forecast_10m.get('fatigue_prob', None),
+                    }
+                except Exception as e:
+                    analysis['forecast'] = {}
+                    self.add_log(f"⚠️ Forecast error: {e}")
+
                 
                 # If Focus Mode is active, integrate its scores
                 if self.focus_session.is_active:
@@ -2166,14 +3043,66 @@ class MindShieldGUI:
                     analysis['focus_score'] = focus_status.get('focus_score', analysis['focus_score'])
                     # Use Focus Mode's productivity
                     analysis['productivity'] = focus_status.get('productivity', analysis['productivity'])
+
+                # Adaptive learning and emotional intelligence (local-only)
+                self.adaptive_learning.update(metrics)
+                thresholds = self.adaptive_learning.adaptive_thresholds()
+                emotion_state = self.emotion_engine.assess(
+                    analysis,
+                    posture_score=float(metrics.get('posture_score', 70)),
+                    face_confidence=float(self.face_auth_state.confidence if self.face_auth_state else 0),
+                )
+                analysis['emotion_state'] = emotion_state.__dict__.copy()
+
+                burnout_state = self.burnout_engine.forecast(list(self.engine.history))
+                analysis['burnout_state'] = burnout_state.__dict__.copy()
+                analysis['adaptive_thresholds'] = thresholds
+
+                try:
+                    self.event_bus.emit('analysis', analysis)
+                except Exception:
+                    pass
+
+                # Gamification update (after focus override)
+                try:
+                    game_state = self.gamification.update(analysis.get('focus_score', 0), analysis.get('risk_score', 0))
+                    analysis['gamification'] = game_state.as_dict()
+                except Exception as e:
+                    analysis['gamification'] = {}
+                    self.add_log(f"⚠️ Gamification error: {e}")
                 
                 self.update_display(analysis, metrics)
+
+                try:
+                    self.local_storage.save_payload('fatigue_logs', {
+                        'ts': datetime.now().isoformat(),
+                        'risk_score': analysis.get('risk_score', 0),
+                        'emotion_state': analysis.get('emotion_state', {}),
+                        'burnout_state': analysis.get('burnout_state', {}),
+                        'focus_score': analysis.get('focus_score', 0),
+                    })
+                except Exception:
+                    pass
+
+                # Update study assistant suggestions
+                self._update_study_plan(analysis)
+
+                # Persist snapshots every 5 seconds for local analytics.
+                now = time.time()
+                if now - self.last_persist_time >= 5:
+                    self.session_store.save_analysis(analysis, metrics)
+                    self.last_persist_time = now
+
+                # Refresh summary less frequently to keep UI responsive.
+                if now - self.last_summary_refresh >= 10:
+                    self._refresh_daily_summary()
+                    self.last_summary_refresh = now
                 
                 # Smart break reminders
                 self._check_break_reminders(analysis, metrics)
                 
             except Exception as e:
-                self.add_log(f"⚠️ {str(e)[:40]}")
+                self.add_log(f"⚠️ Update error: {e}")
         
         # Update Focus Mode UI (timer, score, etc.)
         if self.focus_session.is_active:
